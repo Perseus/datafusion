@@ -12,7 +12,7 @@ use crate::expressions::Column;
 use crate::intervals::cp_solver::{ExprIntervalGraph, PropagationResult};
 use crate::utils::collect_columns;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     ColumnStatistics, Result, ScalarValue, assert_or_internal_err,
@@ -150,8 +150,10 @@ impl ExprBoundaries {
 ///
 /// * `AnalysisContext` constructed by pruned boundaries and a selectivity value.
 ///   The selectivity is `None` when the number of values of a column in `expr`
-///   is unknown, e.g. the column has no min/max statistics or its range holds
-///   more than [`u64::MAX`] values.
+///   is unknown, e.g. the column has no min/max statistics, its range holds
+///   more than [`u64::MAX`] values, or a non-discrete column (`Float*`,
+///   fractional `Decimal*`, `Date64`, sub-second `Timestamp`) collapses to a
+///   single point without a known `distinct_count`.
 pub fn analyze(
     expr: &Arc<dyn PhysicalExpr>,
     context: AnalysisContext,
@@ -258,42 +260,48 @@ fn shrink_boundaries(
     Ok(AnalysisContext::new(target_boundaries).with_selectivity(selectivity))
 }
 
-/// Returns `Some(1.0 / distinct_count)` when the filter demonstrably collapsed
-/// a non-singleton interval down to a single point, i.e. an equality predicate
-/// was applied.  Returns `None` in all other cases, signalling that the caller
-/// should fall back to [`cardinality_ratio`].
+/// Returns `true` for discrete unit-step types whose min/max span is a
+/// meaningful count of candidate values: integers, `Date32`, second-resolution
+/// timestamps, and zero/negative-scale decimals.
+///
+/// Continuous and sub-unit scaled types (`Float*`, fractional `Decimal*`,
+/// `Date64`, sub-second `Timestamp`) are excluded because counting every
+/// representable step (ULP, fractional decimal step, ms/us/ns) between `min`
+/// and `max` is an artifact of representation resolution rather than distinct
+/// column values.
+fn is_discrete_unit_type(data_type: &DataType) -> bool {
+    match data_type {
+        dt if dt.is_integer() => true,
+        DataType::Date32 | DataType::Timestamp(TimeUnit::Second, _) => true,
+        DataType::Decimal32(_, s)
+        | DataType::Decimal64(_, s)
+        | DataType::Decimal128(_, s)
+        | DataType::Decimal256(_, s) => *s <= 0,
+        _ => false,
+    }
+}
+
+/// Returns `true` when the filter demonstrably collapsed a non-singleton
+/// interval down to a single non-null point (e.g. an equality predicate
+/// `col = literal`).
 ///
 /// The `initial_interval` guard prevents double-counting selectivity when the
-/// column statistics already described a singleton before any filter was
-/// applied: if the initial interval was already the same single point, no
-/// additional selectivity has been gained and the `1 / NDV` shortcut must not
-/// fire.
-fn singleton_selectivity(
+/// column statistics already described that same singleton before filtering.
+fn is_newly_narrowed_singleton(
     initial_interval: &Interval,
     target_interval: &Interval,
-    distinct_count: usize,
-) -> Option<f64> {
-    // The target must have collapsed to a single non-null value.
-    if distinct_count == 0
-        || target_interval.lower().is_null()
+) -> bool {
+    if target_interval.lower().is_null()
         || target_interval.lower() != target_interval.upper()
     {
-        return None;
+        return false;
     }
 
-    // Only treat this as a newly-applied equality filter when the initial
-    // interval was not already that same singleton.  If it was, the stats
-    // already encoded this restriction and applying 1/NDV again would
-    // under-estimate the row count.
     let initial_is_same_singleton = !initial_interval.lower().is_null()
         && initial_interval.lower() == initial_interval.upper()
         && initial_interval.lower() == target_interval.lower();
 
-    if initial_is_same_singleton {
-        return None;
-    }
-
-    Some(1.0 / distinct_count as f64)
+    !initial_is_same_singleton
 }
 
 /// This function calculates the filter predicate's selectivity by comparing
@@ -301,8 +309,10 @@ fn singleton_selectivity(
 /// ratio of rows in a table that satisfy the filter's predicate.
 ///
 /// Returns `None` if the number of values of one of `expr_columns`, the
-/// columns in the predicate, is unknown before or after pruning. Without it,
-/// the ratio is unknown, and assuming 1.0 would overestimate the rows.
+/// columns in the predicate, is unknown before or after pruning, or if a
+/// non-discrete column collapses to a single point without a known
+/// `distinct_count`. Without it, the ratio is unknown, and assuming 1.0 or
+/// `1 / step_count` would misestimate the rows.
 fn calculate_selectivity(
     target_boundaries: &[ExprBoundaries],
     initial_boundaries: &[ExprBoundaries],
@@ -320,16 +330,17 @@ fn calculate_selectivity(
     for (initial, target) in initial_boundaries.iter().zip(target_boundaries) {
         match (initial.interval.as_ref(), target.interval.as_ref()) {
             (Some(initial_interval), Some(target_interval)) => {
-                if let Precision::Exact(distinct_count)
-                | Precision::Inexact(distinct_count) = target.distinct_count
-                    && let Some(s) = singleton_selectivity(
-                        initial_interval,
-                        target_interval,
-                        distinct_count,
-                    )
-                {
-                    acc *= s;
-                    continue;
+                if is_newly_narrowed_singleton(initial_interval, target_interval) {
+                    if let Precision::Exact(distinct_count)
+                    | Precision::Inexact(distinct_count) = target.distinct_count
+                        && distinct_count > 0
+                    {
+                        acc *= 1.0 / distinct_count as f64;
+                        continue;
+                    }
+                    if !is_discrete_unit_type(&target_interval.data_type()) {
+                        return Ok(None);
+                    }
                 }
                 if expr_columns.contains(&target.column)
                     && (initial_interval.cardinality().is_none()
@@ -365,7 +376,9 @@ mod tests {
 
     use crate::{AnalysisContext, create_physical_expr, expressions::Column};
 
-    use super::{ExprBoundaries, analyze, calculate_selectivity, singleton_selectivity};
+    use super::{
+        ExprBoundaries, analyze, calculate_selectivity, is_newly_narrowed_singleton,
+    };
 
     fn make_field(name: &str, data_type: DataType) -> Field {
         let nullable = false;
@@ -531,37 +544,143 @@ mod tests {
     }
 
     /// When the initial interval is already the same singleton as the target,
-    /// `singleton_selectivity` must return `None` so we do not double-apply
-    /// 1/NDV selectivity.
+    /// `is_newly_narrowed_singleton` must return `false` so we do not
+    /// double-apply 1/NDV selectivity.
     #[test]
     fn test_singleton_selectivity_skipped_when_initial_is_same_singleton() {
         let singleton =
             Interval::try_new(ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(5)))
                 .unwrap();
-        // Both initial and target are [5, 5] — no new equality filter was applied.
-        assert_eq!(
-            singleton_selectivity(&singleton, &singleton, 10),
-            None,
-            "shortcut must not fire when initial interval was already the same singleton"
+        assert!(
+            !is_newly_narrowed_singleton(&singleton, &singleton),
+            "must not fire when initial interval was already the same singleton"
         );
     }
 
     /// When the initial interval is a broader range and the target collapses to
-    /// a singleton, `singleton_selectivity` must return `Some(1/NDV)`.
+    /// a singleton with known NDV, `calculate_selectivity` returns `1/NDV`.
     #[test]
     fn test_singleton_selectivity_applied_when_range_collapses() {
-        let initial =
-            Interval::try_new(ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(100)))
-                .unwrap();
-        let target =
-            Interval::try_new(ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(5)))
-                .unwrap();
-        let result = singleton_selectivity(&initial, &target, 10);
-        assert_eq!(
-            result,
-            Some(0.1),
-            "shortcut must return 1/NDV when a range collapses to a singleton"
+        let columns = [Column::new("a", 0)];
+        let initial = make_boundary(1, 100, 10);
+        let target = make_boundary(5, 5, 10);
+        let result = calculate_selectivity(&[target], &[initial], &columns)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (result - 0.1).abs() < 1e-12,
+            "shortcut must return 1/NDV when a range collapses to a singleton, got {result}"
         );
+    }
+
+    #[test]
+    fn test_calculate_selectivity_non_discrete_singleton_without_ndv() {
+        let columns = [Column::new("x", 0)];
+        let non_discrete_cases = [
+            (
+                ScalarValue::Float32(Some(1.5)),
+                ScalarValue::Float32(Some(5.5)),
+                ScalarValue::Float32(Some(2.5)),
+            ),
+            (
+                ScalarValue::Float64(Some(0.0)),
+                ScalarValue::Float64(Some(10.0)),
+                ScalarValue::Float64(Some(5.0)),
+            ),
+            (
+                ScalarValue::Decimal128(Some(-1000), 5, 2),
+                ScalarValue::Decimal128(Some(-500), 5, 2),
+                ScalarValue::Decimal128(Some(-500), 5, 2),
+            ),
+            (
+                ScalarValue::Date64(Some(0)),
+                ScalarValue::Date64(Some(10 * 86_400_000)),
+                ScalarValue::Date64(Some(2 * 86_400_000)),
+            ),
+            (
+                ScalarValue::TimestampMicrosecond(Some(0), None),
+                ScalarValue::TimestampMicrosecond(Some(3_600_000_000), None),
+                ScalarValue::TimestampMicrosecond(Some(1_000_000), None),
+            ),
+        ];
+
+        for (lo, hi, point) in non_discrete_cases {
+            let initial = ExprBoundaries {
+                column: Column::new("x", 0),
+                interval: Some(Interval::try_new(lo, hi).unwrap()),
+                distinct_count: Precision::Absent,
+            };
+            let target = ExprBoundaries {
+                column: Column::new("x", 0),
+                interval: Some(Interval::try_new(point.clone(), point.clone()).unwrap()),
+                distinct_count: Precision::Absent,
+            };
+            assert_eq!(
+                calculate_selectivity(
+                    std::slice::from_ref(&target),
+                    std::slice::from_ref(&initial),
+                    &columns,
+                )
+                .unwrap(),
+                None,
+                "expected None without NDV for {:?}",
+                point.data_type()
+            );
+
+            // Known NDV still computes exact 1 / NDV.
+            let initial_ndv = ExprBoundaries {
+                distinct_count: Precision::Inexact(50),
+                ..initial
+            };
+            let target_ndv = ExprBoundaries {
+                distinct_count: Precision::Inexact(50),
+                ..target
+            };
+            let s = calculate_selectivity(&[target_ndv], &[initial_ndv], &columns)
+                .unwrap()
+                .unwrap();
+            assert!((s - 0.02).abs() < 1e-12);
+        }
+
+        // Discrete unit-step types keep exact 1 / span without NDV.
+        let discrete_cases = [
+            (
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(100)),
+                ScalarValue::Int64(Some(42)),
+            ),
+            (
+                ScalarValue::Date32(Some(0)),
+                ScalarValue::Date32(Some(99)),
+                ScalarValue::Date32(Some(42)),
+            ),
+            (
+                ScalarValue::TimestampSecond(Some(0), None),
+                ScalarValue::TimestampSecond(Some(99), None),
+                ScalarValue::TimestampSecond(Some(42), None),
+            ),
+            (
+                ScalarValue::Decimal128(Some(1), 5, 0),
+                ScalarValue::Decimal128(Some(100), 5, 0),
+                ScalarValue::Decimal128(Some(42), 5, 0),
+            ),
+        ];
+        for (lo, hi, point) in discrete_cases {
+            let initial = ExprBoundaries {
+                column: Column::new("x", 0),
+                interval: Some(Interval::try_new(lo, hi).unwrap()),
+                distinct_count: Precision::Absent,
+            };
+            let target = ExprBoundaries {
+                column: Column::new("x", 0),
+                interval: Some(Interval::try_new(point.clone(), point).unwrap()),
+                distinct_count: Precision::Absent,
+            };
+            let s = calculate_selectivity(&[target], &[initial], &columns)
+                .unwrap()
+                .unwrap();
+            assert!((s - 0.01).abs() < 1e-12);
+        }
     }
 
     /// Regression test: `calculate_selectivity` must not apply the `1/NDV`
