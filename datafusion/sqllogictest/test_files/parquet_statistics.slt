@@ -157,7 +157,7 @@ query TT
 EXPLAIN SELECT f32 FROM typed_table WHERE f32 = 2.5;
 ----
 physical_plan
-01)FilterExec: CAST(f32@0 AS Float64) = 2.5, statistics=[Rows=Inexact(1), Bytes=Inexact(1), [(Col[0]: Min=Exact(Float32(2.5)) Max=Exact(Float32(2.5)) Null=Inexact(0) Distinct=Inexact(1) ScanBytes=Inexact(1))]]
+01)FilterExec: CAST(f32@0 AS Float64) = 2.5, statistics=[Rows=Inexact(1), Bytes=Inexact(4), [(Col[0]: Min=Exact(Float32(2.5)) Max=Exact(Float32(2.5)) Null=Inexact(0) Distinct=Inexact(1) ScanBytes=Inexact(4))]]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, statistics=[Rows=Inexact(5), Bytes=Inexact(20), [(Col[0]: Min=Inexact(Float32(1.5)) Max=Inexact(Float32(5.5)) Null=Inexact(0) ScanBytes=Inexact(20))]]
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/typed_table.parquet]]}, projection=[f32], file_type=parquet, predicate=CAST(f32@2 AS Float64) = 2.5, pruning_predicate=f32_null_count@2 != row_count@3 AND CAST(f32_min@0 AS Float64;N) <= 2.5 AND 2.5 <= CAST(f32_max@1 AS Float64;N), required_guarantees=[], statistics=[Rows=Inexact(5), Bytes=Inexact(20), [(Col[0]: Min=Inexact(Float32(1.5)) Max=Inexact(Float32(5.5)) Null=Inexact(0) ScanBytes=Inexact(20))]]
 
@@ -166,7 +166,7 @@ query TT
 EXPLAIN SELECT f64 FROM typed_table WHERE 2.5 = f64;
 ----
 physical_plan
-01)FilterExec: f64@0 = 2.5, statistics=[Rows=Inexact(1), Bytes=Inexact(1), [(Col[0]: Min=Exact(Float64(2.5)) Max=Exact(Float64(2.5)) Null=Exact(0) Distinct=Inexact(1) ScanBytes=Inexact(1))]]
+01)FilterExec: f64@0 = 2.5, statistics=[Rows=Inexact(1), Bytes=Inexact(8), [(Col[0]: Min=Exact(Float64(2.5)) Max=Exact(Float64(2.5)) Null=Exact(0) Distinct=Inexact(1) ScanBytes=Inexact(8))]]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, statistics=[Rows=Inexact(5), Bytes=Inexact(40), [(Col[0]: Min=Inexact(Float64(1.5)) Max=Inexact(Float64(5.5)) Null=Inexact(0) ScanBytes=Inexact(40))]]
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/typed_table.parquet]]}, projection=[f64], file_type=parquet, predicate=f64@3 = 2.5, pruning_predicate=f64_null_count@2 != row_count@3 AND f64_min@0 <= 2.5 AND 2.5 <= f64_max@1, required_guarantees=[f64 in (2.5)], statistics=[Rows=Inexact(5), Bytes=Inexact(40), [(Col[0]: Min=Inexact(Float64(1.5)) Max=Inexact(Float64(5.5)) Null=Inexact(0) ScanBytes=Inexact(40))]]
 
@@ -488,10 +488,81 @@ physical_plan
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/nullable_key.parquet]]}, projection=[k], file_type=parquet, statistics=[Rows=Exact(10000), Bytes=Exact(40000), [(Col[0]: Min=Exact(Int32(1)) Max=Exact(Int32(7)) Null=Exact(0) ScanBytes=Exact(40000))]]
 
 statement ok
-SET datafusion.explain.show_statistics = false;
+DROP TABLE nullable_key;
+
+######
+# Non-discrete point equalities without NDV (Float*, sub-second Timestamp,
+# Date64) fall back to default_filter_selectivity while keeping tightened
+# bounds; discrete types (Int32, Date32, Timestamp(Second)) keep 1 / span.
+######
 
 statement ok
-DROP TABLE nullable_key;
+SET datafusion.execution.target_partitions = 1;
+
+statement ok
+COPY (
+    SELECT
+        CAST(value % 100 AS INT) AS score,
+        arrow_cast(10000 + value % 100, 'Date32') AS d32,
+        CAST(value % 10 AS DOUBLE) AS f64,
+        arrow_cast(1000000 * (value % 3600), 'Timestamp(Microsecond, None)') AS ts_us,
+        arrow_cast(value % 100, 'Timestamp(Second, None)') AS ts_s,
+        arrow_cast(86400000 * (value % 10), 'Date64') AS d64
+    FROM range(1000)
+)
+TO 'test_files/scratch/parquet_statistics/non_discrete_eq.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE non_discrete_eq STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_statistics/non_discrete_eq.parquet';
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE f64 = 5.0;
+----
+physical_plan
+01)FilterExec: f64@1 = 5, projection=[score@0], statistics=[Rows=Inexact(200), Bytes=Inexact(2400), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(800))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score, f64], file_type=parquet, predicate=f64@2 = 5, pruning_predicate=f64_null_count@2 != row_count@3 AND f64_min@0 <= 5 AND 5 <= f64_max@1, required_guarantees=[f64 in (5)], statistics=[Rows=Inexact(1000), Bytes=Inexact(12000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000)),(Col[1]: Min=Inexact(Float64(0)) Max=Inexact(Float64(9)) Null=Inexact(0) ScanBytes=Inexact(8000))]]
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE ts_us = arrow_cast(1000000, 'Timestamp(Microsecond, None)');
+----
+physical_plan
+01)FilterExec: ts_us@1 = 1000000, projection=[score@0], statistics=[Rows=Inexact(200), Bytes=Inexact(2400), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(800))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score, ts_us], file_type=parquet, predicate=ts_us@3 = 1000000, pruning_predicate=ts_us_null_count@2 != row_count@3 AND ts_us_min@0 <= 1000000 AND 1000000 <= ts_us_max@1, required_guarantees=[ts_us in (1000000)], statistics=[Rows=Inexact(1000), Bytes=Inexact(12000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000)),(Col[1]: Min=Inexact(TimestampMicrosecond(0, None)) Max=Inexact(TimestampMicrosecond(999000000, None)) Null=Inexact(0) ScanBytes=Inexact(8000))]]
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE d64 = arrow_cast(172800000, 'Date64');
+----
+physical_plan
+01)FilterExec: d64@1 = 1970-01-03, projection=[score@0], statistics=[Rows=Inexact(200), Bytes=Inexact(2400), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(800))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score, d64], file_type=parquet, predicate=d64@5 = 1970-01-03, pruning_predicate=d64_null_count@2 != row_count@3 AND d64_min@0 <= 1970-01-03 AND 1970-01-03 <= d64_max@1, required_guarantees=[d64 in (1970-01-03)], statistics=[Rows=Inexact(1000), Bytes=Inexact(12000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000)),(Col[1]: Min=Inexact(Date64("1970-01-01")) Max=Inexact(Date64("1970-01-10")) Null=Inexact(0) ScanBytes=Inexact(8000))]]
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE score = 42;
+----
+physical_plan
+01)FilterExec: score@0 = 42, statistics=[Rows=Inexact(10), Bytes=Inexact(40), [(Col[0]: Min=Exact(Int32(42)) Max=Exact(Int32(42)) Null=Exact(0) Distinct=Inexact(1) ScanBytes=Inexact(40))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score], file_type=parquet, predicate=score@0 = 42, pruning_predicate=score_null_count@2 != row_count@3 AND score_min@0 <= 42 AND 42 <= score_max@1, required_guarantees=[score in (42)], statistics=[Rows=Inexact(1000), Bytes=Inexact(4000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000))]]
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE d32 = arrow_cast(10042, 'Date32');
+----
+physical_plan
+01)FilterExec: d32@1 = 1997-06-30, projection=[score@0], statistics=[Rows=Inexact(10), Bytes=Inexact(80), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(40))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score, d32], file_type=parquet, predicate=d32@1 = 1997-06-30, pruning_predicate=d32_null_count@2 != row_count@3 AND d32_min@0 <= 1997-06-30 AND 1997-06-30 <= d32_max@1, required_guarantees=[d32 in (1997-06-30)], statistics=[Rows=Inexact(1000), Bytes=Inexact(8000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000)),(Col[1]: Min=Inexact(Date32("1997-05-19")) Max=Inexact(Date32("1997-08-26")) Null=Inexact(0) ScanBytes=Inexact(4000))]]
+
+query TT
+EXPLAIN SELECT score FROM non_discrete_eq WHERE ts_s = arrow_cast(42, 'Timestamp(Second, None)');
+----
+physical_plan
+01)FilterExec: ts_s@1 = 42, projection=[score@0], statistics=[Rows=Inexact(10), Bytes=Inexact(120), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(40))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/non_discrete_eq.parquet]]}, projection=[score, ts_s], file_type=parquet, predicate=ts_s@4 = 42, pruning_predicate=ts_s_null_count@2 != row_count@3 AND ts_s_min@0 <= 42 AND 42 <= ts_s_max@1, required_guarantees=[ts_s in (42)], statistics=[Rows=Inexact(1000), Bytes=Inexact(12000), [(Col[0]: Min=Inexact(Int32(0)) Max=Inexact(Int32(99)) Null=Inexact(0) ScanBytes=Inexact(4000)),(Col[1]: Min=Inexact(TimestampSecond(0, None)) Max=Inexact(TimestampSecond(99, None)) Null=Inexact(0) ScanBytes=Inexact(8000))]]
+
+statement ok
+DROP TABLE non_discrete_eq;
+
+statement ok
+SET datafusion.explain.show_statistics = false;
 
 statement ok
 SET datafusion.execution.target_partitions = 4;
